@@ -1,0 +1,101 @@
+name: Build Linux desktop release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New package version, e.g. 1.0.0'
+        type: string
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: linux-desktop-release
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ inputs.version }}
+    outputs:
+      upstream: ${{ steps.revision.outputs.sha }}
+    steps:
+      - name: Validate version
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){2}$ ]] || { echo 'Use a version such as 1.0.0'; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: revision
+        name: Read synced upstream revision
+        run: |
+          sha=$(cat upstream-revision.txt)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: ${{ steps.revision.outputs.sha }}
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev rsync
+          corepack enable
+      - name: Install and build upstream
+        working-directory: upstream
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build:native-system
+          pnpm run build:lib
+          pnpm run build:web
+      - name: Build package and checksum
+        run: |
+          desktop/build-deb.sh "$VERSION" upstream
+          cd dist-linux
+          sha256sum ./*.deb > SHA256SUMS
+      - name: Smoke test packaged runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          install="$GITHUB_WORKSPACE/upstream/.desktop-build-linux/pkg/opt/deepseek-harness"
+          export HOME="$(mktemp -d)"
+          cd "$install/dsh"
+          "$install/node/bin/node" apps/cli/lib/bin.js web --port 43872 > /tmp/dsh-package-smoke.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; cat /tmp/dsh-package-smoke.log' EXIT
+          for i in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:43872/ >/dev/null; then exit 0; fi
+            kill -0 "$pid" 2>/dev/null || exit 1
+            sleep 1
+          done
+          exit 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-desktop-${{ inputs.version }}
+          path: dist-linux/
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+      UPSTREAM_SHA: ${{ needs.build.outputs.upstream }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-desktop-${{ inputs.version }}
+          path: dist-linux
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){2}$ ]]
+          notes=$(printf 'Community Linux amd64 desktop package.\n\nOfficial upstream commit: %s\nPackaging commit: %s\n\nUnsigned build; SHA256SUMS checks download integrity.' "$UPSTREAM_SHA" "$GITHUB_SHA")
+          gh release create "v$VERSION" dist-linux/*.deb dist-linux/SHA256SUMS --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Linux desktop v$VERSION" --notes "$notes"

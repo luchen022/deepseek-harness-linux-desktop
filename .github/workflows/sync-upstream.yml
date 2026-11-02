@@ -1,0 +1,32 @@
+name: Sync upstream
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Record latest official master commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(gh api repos/deepseek-ai/deepseek-harness/commits/master --jq .sha)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          printf '%s\n' "$sha" > upstream-revision.txt
+          if git diff --quiet -- upstream-revision.txt; then
+            echo "Already at $sha"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add upstream-revision.txt
+          git commit -m "Sync upstream to $sha"
+          git push origin HEAD:main
