@@ -46,6 +46,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev rsync
           corepack enable
+      - name: Test desktop startup URL handling
+        run: |
+          gcc -Wall -Wextra -Werror -std=c11 tests/startup-url.c -o /tmp/dsh-startup-url-test
+          /tmp/dsh-startup-url-test
       - name: Install and build upstream
         working-directory: upstream
         run: |
@@ -63,16 +67,24 @@ jobs:
         run: |
           set -euo pipefail
           install="$GITHUB_WORKSPACE/upstream/.desktop-build-linux/pkg/opt/deepseek-harness"
-          export HOME="$(mktemp -d)"
+          export DSH_HOME="$(mktemp -d)"
+          log_file="$(mktemp)"
+          cookie_file="$(mktemp)"
           cd "$install/dsh"
-          "$install/node/bin/node" apps/cli/lib/bin.js web --port 43872 > /tmp/dsh-package-smoke.log 2>&1 &
+          "$install/node/bin/node" apps/cli/lib/bin.js web --port 43872 --no-open > "$log_file" 2>&1 &
           pid=$!
-          trap 'kill "$pid" 2>/dev/null || true; cat /tmp/dsh-package-smoke.log' EXIT
+          trap 'kill "$pid" 2>/dev/null || true; sed -E "s/(token=)[^[:space:]&]+/\\1[REDACTED]/g" "$log_file"; rm -f "$log_file" "$cookie_file"' EXIT
           for i in $(seq 1 90); do
-            if curl --fail --silent http://127.0.0.1:43872/ >/dev/null; then exit 0; fi
+            url=$(sed -nE 's#^dsh web: (http://127\.0\.0\.1:43872/\?token=[A-Za-z0-9_-]+)\r?$#\1#p' "$log_file" | head -n 1)
+            if [[ -n "$url" ]]; then
+              curl --fail --silent --show-error --location --cookie-jar "$cookie_file" --cookie "$cookie_file" "$url" > "$DSH_HOME/index.html"
+              grep -qi '<html' "$DSH_HOME/index.html"
+              exit 0
+            fi
             kill -0 "$pid" 2>/dev/null || exit 1
             sleep 1
           done
+          echo 'Timed out waiting for the authenticated startup URL' >&2
           exit 1
       - uses: actions/upload-artifact@v4
         with:
